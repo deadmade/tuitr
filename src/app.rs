@@ -44,14 +44,36 @@ fn set_clipboard(text: String) -> Result<()> {
         return Ok(());
     }
 
-    // Fallback for macOS / Windows
     arboard::Clipboard::new()?.set_text(text)?;
     Ok(())
+}
+
+fn load_persisted_comments(root: &Path) -> HashMap<String, HashMap<usize, String>> {
+    let path = root.join(".tuitr.json");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&content) else {
+        return HashMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(file, val)| {
+            let serde_json::Value::Object(cm) = val else {
+                return None;
+            };
+            let comments = cm
+                .into_iter()
+                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_str()?.to_owned())))
+                .collect();
+            Some((file, comments))
+        })
+        .collect()
 }
 
 pub enum Mode {
     Normal,
     EditComment,
+    Search,
 }
 
 pub enum Focus {
@@ -74,6 +96,10 @@ pub struct App {
     pub status: Option<String>,
     pub tree: FileTree,
     pub highlighted_lines: Vec<Vec<(SyntectColor, String)>>,
+    pub search_query: String,
+    pub search_input: String,
+    pub search_matches: Vec<usize>,
+    search_match_idx: usize,
     syntax_set: SyntaxSet,
     theme: Theme,
 }
@@ -98,14 +124,21 @@ impl App {
             (root, abs, lines)
         };
 
+        let mut all_comments = load_persisted_comments(&root);
+        let comments = if file_path.is_empty() {
+            HashMap::new()
+        } else {
+            all_comments.remove(&file_path).unwrap_or_default()
+        };
+
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme = ThemeSet::load_defaults().themes["base16-ocean.dark"].clone();
 
         let mut app = Self {
             file_path,
             lines,
-            comments: HashMap::new(),
-            all_comments: HashMap::new(),
+            comments,
+            all_comments,
             cursor: 0,
             scroll: 0,
             view_height: 20,
@@ -116,6 +149,10 @@ impl App {
             status: None,
             tree: FileTree::new(root),
             highlighted_lines: Vec::new(),
+            search_query: String::new(),
+            search_input: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
             syntax_set,
             theme,
         };
@@ -138,7 +175,6 @@ impl App {
                 } else {
                     0
                 };
-                // top area height - borders (2) = inner view height
                 self.view_height = area.height.saturating_sub(edit_h + 3) as usize;
                 self.view_width = ui::file_area_width(area.width);
                 self.tree.scroll_to_cursor(self.view_height);
@@ -164,6 +200,11 @@ impl App {
 
         if matches!(self.mode, Mode::EditComment) {
             self.handle_edit(key);
+            return false;
+        }
+
+        if matches!(self.mode, Mode::Search) {
+            self.handle_search_input(key);
             return false;
         }
 
@@ -225,6 +266,9 @@ impl App {
             KeyCode::Char('D') => self.delete_all_comments(),
             KeyCode::Char('y') => self.yank(),
             KeyCode::Char('Y') => self.yank_all_comments(),
+            KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('n') => self.next_match(),
+            KeyCode::Char('N') => self.prev_match(),
             _ => {}
         }
     }
@@ -237,6 +281,18 @@ impl App {
                 self.input.pop();
             }
             KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn handle_search_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.confirm_search(),
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Backspace => {
+                self.search_input.pop();
+            }
+            KeyCode::Char(c) => self.search_input.push(c),
             _ => {}
         }
     }
@@ -273,15 +329,16 @@ impl App {
             self.scroll = self.cursor;
             return;
         }
-        // Keep incrementing scroll until cursor fits in view_height display rows.
         loop {
             let rows: usize = (self.scroll..=self.cursor)
                 .map(|i| {
-                    1 + self
-                        .comments
-                        .get(&i)
-                        .map(|comment| ui::comment_box_height(comment, self.view_width))
-                        .unwrap_or(0)
+                    let line = self.lines.get(i).map(|s| s.as_str()).unwrap_or("");
+                    ui::line_display_rows(line, self.view_width)
+                        + self
+                            .comments
+                            .get(&i)
+                            .map(|c| ui::comment_box_height(c, self.view_width))
+                            .unwrap_or(0)
                 })
                 .sum();
             if rows <= self.view_height {
@@ -305,6 +362,7 @@ impl App {
         }
         self.input.clear();
         self.mode = Mode::Normal;
+        self.save_comments();
     }
 
     fn cancel_comment(&mut self) {
@@ -315,6 +373,7 @@ impl App {
     fn delete_comment(&mut self) {
         if self.comments.remove(&self.cursor).is_some() {
             self.status = Some("Comment deleted".to_string());
+            self.save_comments();
         }
     }
 
@@ -326,6 +385,7 @@ impl App {
         }
         self.comments.clear();
         self.status = Some(format!("Deleted {count} comment(s)"));
+        self.save_comments();
     }
 
     fn yank(&mut self) {
@@ -375,6 +435,116 @@ impl App {
         }
     }
 
+    fn start_search(&mut self) {
+        self.search_input = self.search_query.clone();
+        self.mode = Mode::Search;
+    }
+
+    fn confirm_search(&mut self) {
+        self.search_query = self.search_input.trim().to_string();
+        self.mode = Mode::Normal;
+        self.compute_matches();
+        if !self.search_matches.is_empty() {
+            let next = self
+                .search_matches
+                .iter()
+                .find(|&&i| i >= self.cursor)
+                .copied()
+                .unwrap_or(self.search_matches[0]);
+            self.cursor = next;
+            self.search_match_idx = self
+                .search_matches
+                .iter()
+                .position(|&i| i == self.cursor)
+                .unwrap_or(0);
+            self.scroll_to_cursor();
+        } else if !self.search_query.is_empty() {
+            self.status = Some(format!("No matches for \"{}\"", self.search_query));
+        }
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_input.clear();
+        self.mode = Mode::Normal;
+    }
+
+    fn compute_matches(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            return;
+        }
+        let query = self.search_query.to_lowercase();
+        self.search_matches = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+        self.search_match_idx = 0;
+    }
+
+    fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            if !self.search_query.is_empty() {
+                self.status = Some("No matches".to_string());
+            }
+            return;
+        }
+        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.cursor = self.search_matches[self.search_match_idx];
+        self.scroll_to_cursor();
+    }
+
+    fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            if !self.search_query.is_empty() {
+                self.status = Some("No matches".to_string());
+            }
+            return;
+        }
+        self.search_match_idx = self
+            .search_match_idx
+            .checked_sub(1)
+            .unwrap_or(self.search_matches.len() - 1);
+        self.cursor = self.search_matches[self.search_match_idx];
+        self.scroll_to_cursor();
+    }
+
+    fn save_comments(&self) {
+        let path = self.tree.root.join(".tuitr.json");
+
+        let mut all = self.all_comments.clone();
+        if !self.file_path.is_empty() {
+            if self.comments.is_empty() {
+                all.remove(&self.file_path);
+            } else {
+                all.insert(self.file_path.clone(), self.comments.clone());
+            }
+        }
+        all.retain(|_, v| !v.is_empty());
+
+        if all.is_empty() {
+            let _ = fs::remove_file(&path);
+            return;
+        }
+
+        let raw: serde_json::Map<String, serde_json::Value> = all
+            .into_iter()
+            .map(|(file, comments)| {
+                let fm: serde_json::Map<String, serde_json::Value> = comments
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
+                    .collect();
+                (file, serde_json::Value::Object(fm))
+            })
+            .collect();
+
+        if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(raw)) {
+            let _ = fs::write(&path, json);
+        }
+    }
+
     fn load_file(&mut self, path: String) -> Result<()> {
         let content = fs::read_to_string(&path)?;
         self.all_comments
@@ -385,6 +555,7 @@ impl App {
         self.cursor = 0;
         self.scroll = 0;
         self.rehighlight();
+        self.compute_matches();
         Ok(())
     }
 

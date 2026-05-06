@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
 pub struct TreeEntry {
     pub path: PathBuf,
     pub depth: usize,
@@ -17,16 +19,19 @@ pub struct FileTree {
     pub cursor: usize,
     pub scroll: usize,
     expanded: HashSet<PathBuf>,
+    gitignore: Option<Gitignore>,
 }
 
 impl FileTree {
     pub fn new(root: PathBuf) -> Self {
+        let gitignore = build_gitignore(&root);
         let mut tree = Self {
             root: root.clone(),
             entries: Vec::new(),
             cursor: 0,
             scroll: 0,
             expanded: HashSet::new(),
+            gitignore,
         };
         tree.rebuild();
         tree
@@ -46,6 +51,12 @@ impl FileTree {
         let mut entries: Vec<_> = read_dir
             .filter_map(|e| e.ok())
             .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .filter(|e| {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                self.gitignore
+                    .as_ref()
+                    .map_or(true, |gi| !gi.matched(&e.path(), is_dir).is_ignore())
+            })
             .collect();
 
         entries.sort_by(|a, b| {
@@ -118,4 +129,14 @@ impl FileTree {
             self.scroll = self.cursor - view_height + 1;
         }
     }
+}
+
+fn build_gitignore(root: &Path) -> Option<Gitignore> {
+    let gi_path = root.join(".gitignore");
+    if !gi_path.exists() {
+        return None;
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    builder.add(gi_path);
+    builder.build().ok()
 }

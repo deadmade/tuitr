@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -9,6 +9,8 @@ use ratatui::{
 use syntect::highlighting::Color as SyntectColor;
 
 use crate::app::{App, Focus, Mode};
+
+const GUTTER: usize = 9; // "▶ " (2) + "1234 " (5) + "● " (2)
 
 pub fn render(f: &mut Frame, app: &App) {
     let has_edit = matches!(app.mode, Mode::EditComment);
@@ -132,10 +134,11 @@ fn render_file(f: &mut Frame, app: &App, area: Rect) {
         ));
         let y = inner.height / 2;
         let hint_area = Rect { y: inner.y + y, height: 1, ..inner };
-        f.render_widget(Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center), hint_area);
+        f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
         return;
     }
 
+    let text_width = (area.width as usize).saturating_sub(2 + GUTTER).max(1);
     let inner_height = area.height.saturating_sub(2) as usize;
     let mut display: Vec<Line> = Vec::new();
     let mut rows = 0;
@@ -144,9 +147,11 @@ fn render_file(f: &mut Frame, app: &App, area: Rect) {
     while i < app.lines.len() && rows < inner_height {
         let comment = app.comments.get(&i);
         let hl = app.highlighted_lines.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let is_match = !app.search_query.is_empty() && app.search_matches.contains(&i);
 
-        display.push(file_line(i, hl, i == app.cursor, comment.is_some()));
-        rows += 1;
+        let new_lines = file_lines(i, hl, i == app.cursor, comment.is_some(), is_match, text_width);
+        rows += new_lines.len();
+        display.extend(new_lines);
 
         if let Some(comment) = comment {
             for line in inline_comment_bordered(comment, area.width) {
@@ -163,42 +168,88 @@ fn render_file(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(display).block(block), area);
 }
 
-fn file_line(
+fn wrap_spans(
+    hl_spans: &[(SyntectColor, String)],
+    available_width: usize,
+    bg: Color,
+) -> Vec<Vec<Span<'static>>> {
+    let available_width = available_width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![]];
+    let mut col = 0usize;
+
+    for (fg, text) in hl_spans {
+        let fg_color = Color::Rgb(fg.r, fg.g, fg.b);
+        let style = Style::default().fg(fg_color).bg(bg);
+        let mut chunk = String::new();
+
+        for ch in text.chars() {
+            if col == available_width {
+                if !chunk.is_empty() {
+                    rows.last_mut().unwrap().push(Span::styled(chunk.clone(), style));
+                    chunk.clear();
+                }
+                rows.push(vec![]);
+                col = 0;
+            }
+            chunk.push(ch);
+            col += 1;
+        }
+
+        if !chunk.is_empty() {
+            rows.last_mut().unwrap().push(Span::styled(chunk, style));
+        }
+    }
+
+    rows
+}
+
+fn file_lines(
     idx: usize,
     hl_spans: &[(SyntectColor, String)],
     is_cursor: bool,
     has_comment: bool,
-) -> Line<'static> {
+    is_match: bool,
+    text_width: usize,
+) -> Vec<Line<'static>> {
     let bg = if is_cursor { Color::DarkGray } else { Color::Reset };
+    let wrapped = wrap_spans(hl_spans, text_width, bg);
+    let mut lines = Vec::new();
 
-    let mut spans = vec![
-        Span::styled(
-            if is_cursor { "▶ " } else { "  " },
-            Style::default().fg(Color::Yellow).bg(bg),
-        ),
-        Span::styled(
-            format!("{:4} ", idx + 1),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ),
-        Span::styled(
-            if has_comment { "● " } else { "  " },
-            Style::default().fg(Color::Cyan).bg(bg),
-        ),
-    ];
+    for (row, spans) in wrapped.into_iter().enumerate() {
+        let mut row_spans: Vec<Span<'static>> = if row == 0 {
+            vec![
+                Span::styled(
+                    if is_cursor {
+                        "▶ "
+                    } else if is_match {
+                        "◆ "
+                    } else {
+                        "  "
+                    },
+                    Style::default().fg(Color::Yellow).bg(bg),
+                ),
+                Span::styled(
+                    format!("{:4} ", idx + 1),
+                    Style::default().fg(Color::DarkGray).bg(bg),
+                ),
+                Span::styled(
+                    if has_comment { "● " } else { "  " },
+                    Style::default().fg(Color::Cyan).bg(bg),
+                ),
+            ]
+        } else {
+            vec![Span::styled(" ".repeat(GUTTER), Style::default().bg(bg))]
+        };
 
-    for (fg, text) in hl_spans {
-        spans.push(Span::styled(
-            text.clone(),
-            Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b)).bg(bg),
-        ));
+        row_spans.extend(spans);
+        lines.push(Line::from(row_spans));
     }
 
-    Line::from(spans)
+    lines
 }
 
 fn inline_comment_bordered(text: &str, area_width: u16) -> Vec<Line<'static>> {
-    // 9-space indent: 2 (cursor) + 5 (line num) + 2 (marker)
-    let pad = "         ";
+    let pad = "         "; // 9 spaces = GUTTER
     let text_width = comment_text_width(area_width);
     let border_width = text_width + 2;
     let border = Style::default().fg(Color::DarkGray);
@@ -227,6 +278,12 @@ fn inline_comment_bordered(text: &str, area_width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+pub(crate) fn line_display_rows(line: &str, view_width: u16) -> usize {
+    let available = (view_width as usize).saturating_sub(2 + GUTTER).max(1);
+    let n = line.chars().count();
+    if n == 0 { 1 } else { n.div_ceil(available) }
+}
+
 pub(crate) fn comment_box_height(text: &str, area_width: u16) -> usize {
     wrap_text(text, comment_text_width(area_width)).len() + 2
 }
@@ -242,7 +299,6 @@ pub(crate) fn file_area_width(total_width: u16) -> u16 {
 }
 
 fn comment_text_width(area_width: u16) -> usize {
-    // Paragraph text is rendered inside the pane border, then indented before the note box.
     (area_width as usize).saturating_sub(15).max(1)
 }
 
@@ -327,6 +383,19 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw("  Enter:confirm  Esc:cancel"),
             ]),
+            (Mode::Search, _) => Line::from(vec![
+                Span::styled(
+                    " SEARCH ",
+                    Style::default()
+                        .bg(Color::Magenta)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  /"),
+                Span::styled(app.search_input.clone(), Style::default().fg(Color::White)),
+                Span::styled("_", Style::default().fg(Color::DarkGray)),
+                Span::raw("  Enter:confirm  Esc:cancel"),
+            ]),
             (Mode::Normal, Focus::Tree) => Line::from(vec![
                 Span::styled(
                     " TREE ",
@@ -346,7 +415,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(
-                    "  j/k:nav  c:comment  d:delete  D:delete-all  y:yank  Y:yank-issues  g/G:top/bot  Tab:switch  q:quit",
+                    "  j/k:nav  /:search  n/N:next/prev  c:comment  d:del  D:del-all  y:yank  Y:yank-issues  g/G:top/bot  Tab:switch  q:quit",
                 ),
             ]),
         }
