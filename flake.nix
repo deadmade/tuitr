@@ -18,10 +18,19 @@
       let
         pkgs = import nixpkgs { inherit system; };
         naersk-lib = pkgs.callPackage naersk { };
+        tuitr = naersk-lib.buildPackage {
+          src = ./.;
+          nativeBuildInputs = with pkgs; [ pkg-config ];
+          buildInputs = with pkgs; lib.optionals stdenv.isLinux [ xorg.libxcb ];
+        };
       in
       {
-        defaultPackage = naersk-lib.buildPackage ./.;
-        devShell =
+        packages = {
+          default = tuitr;
+          inherit tuitr;
+        };
+
+        devShells.default =
           with pkgs;
           mkShell {
             buildInputs = [
@@ -38,5 +47,14 @@
             RUST_SRC_PATH = rustPlatform.rustLibSrc;
           };
       }
-    );
+    )
+    // {
+      # Add to your nixconfig with:
+      #   inputs.tuitr.url = "github:deadmade/tuitr";
+      #   nixpkgs.overlays = [ inputs.tuitr.overlays.default ];
+      # Then use pkgs.tuitr anywhere.
+      overlays.default = final: _prev: {
+        tuitr = self.packages.${final.system}.default;
+      };
+    };
 }
