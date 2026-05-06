@@ -101,6 +101,41 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_file(f: &mut Frame, app: &App, area: Rect) {
+    let focused = matches!(app.focus, Focus::File);
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+
+    let (title, block) = if app.file_path.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" No file open ")
+            .border_style(border_style);
+        (None, block)
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", app.file_path))
+            .title_style(Style::default().add_modifier(Modifier::BOLD))
+            .border_style(border_style);
+        (Some(()), block)
+    };
+
+    if title.is_none() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let hint = Line::from(Span::styled(
+            "Open a file from the tree (Enter / l)",
+            Style::default().fg(Color::DarkGray),
+        ));
+        let y = inner.height / 2;
+        let hint_area = Rect { y: inner.y + y, height: 1, ..inner };
+        f.render_widget(Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center), hint_area);
+        return;
+    }
+
     let inner_height = area.height.saturating_sub(2) as usize;
     let mut display: Vec<Line> = Vec::new();
     let mut rows = 0;
@@ -124,19 +159,6 @@ fn render_file(f: &mut Frame, app: &App, area: Rect) {
 
         i += 1;
     }
-
-    let focused = matches!(app.focus, Focus::File);
-    let border_style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", app.file_path))
-        .title_style(Style::default().add_modifier(Modifier::BOLD))
-        .border_style(border_style);
 
     f.render_widget(Paragraph::new(display).block(block), area);
 }
@@ -324,7 +346,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(
-                    "  j/k:nav  c:comment  d:delete  y:yank  g/G:top/bot  Tab:switch  q:quit",
+                    "  j/k:nav  c:comment  d:delete  D:delete-all  y:yank  Y:yank-issues  g/G:top/bot  Tab:switch  q:quit",
                 ),
             ]),
         }

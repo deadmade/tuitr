@@ -16,6 +16,39 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{tree::FileTree, ui};
 
+fn set_clipboard(text: String) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cmds: &[(&str, &[&str])] = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        &[("wl-copy", &[] as &[&str])]
+    } else {
+        &[
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    for (cmd, args) in cmds {
+        let Ok(mut child) = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait()?;
+        return Ok(());
+    }
+
+    // Fallback for macOS / Windows
+    arboard::Clipboard::new()?.set_text(text)?;
+    Ok(())
+}
+
 pub enum Mode {
     Normal,
     EditComment,
@@ -51,19 +84,25 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.clone());
 
-        let root = Path::new(&abs)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let is_dir = Path::new(&abs).is_dir();
 
-        let content = fs::read_to_string(&abs)?;
-        let lines = content.lines().map(String::from).collect();
+        let (root, file_path, lines) = if is_dir {
+            (Path::new(&abs).to_path_buf(), String::new(), Vec::new())
+        } else {
+            let root = Path::new(&abs)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            let content = fs::read_to_string(&abs)?;
+            let lines = content.lines().map(String::from).collect();
+            (root, abs, lines)
+        };
 
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme = ThemeSet::load_defaults().themes["base16-ocean.dark"].clone();
 
         let mut app = Self {
-            file_path: abs,
+            file_path,
             lines,
             comments: HashMap::new(),
             all_comments: HashMap::new(),
@@ -72,7 +111,7 @@ impl App {
             view_height: 20,
             view_width: 80,
             mode: Mode::Normal,
-            focus: Focus::File,
+            focus: if is_dir { Focus::Tree } else { Focus::File },
             input: String::new(),
             status: None,
             tree: FileTree::new(root),
@@ -173,6 +212,9 @@ impl App {
     }
 
     fn handle_file(&mut self, key: KeyEvent) {
+        if self.file_path.is_empty() {
+            return;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
@@ -180,7 +222,9 @@ impl App {
             KeyCode::Char('G') => self.move_bottom(),
             KeyCode::Char('c') => self.start_comment(),
             KeyCode::Char('d') => self.delete_comment(),
+            KeyCode::Char('D') => self.delete_all_comments(),
             KeyCode::Char('y') => self.yank(),
+            KeyCode::Char('Y') => self.yank_all_comments(),
             _ => {}
         }
     }
@@ -274,6 +318,16 @@ impl App {
         }
     }
 
+    fn delete_all_comments(&mut self) {
+        let count = self.comments.len();
+        if count == 0 {
+            self.status = Some("No comments to delete".to_string());
+            return;
+        }
+        self.comments.clear();
+        self.status = Some(format!("Deleted {count} comment(s)"));
+    }
+
     fn yank(&mut self) {
         let Some(line) = self.lines.get(self.cursor) else {
             return;
@@ -283,8 +337,40 @@ impl App {
         } else {
             format!("Line {}: {}", self.cursor + 1, line)
         };
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        match set_clipboard(text) {
             Ok(_) => self.status = Some("Yanked to clipboard".to_string()),
+            Err(e) => self.status = Some(format!("Clipboard error: {e}")),
+        }
+    }
+
+    fn yank_all_comments(&mut self) {
+        if self.comments.is_empty() {
+            self.status = Some("No comments to yank".to_string());
+            return;
+        }
+
+        let mut entries: Vec<usize> = self.comments.keys().copied().collect();
+        entries.sort_unstable();
+
+        let mut text = format!(
+            "I found the following issues in {}. Please create a plan to fix them:\n",
+            self.file_path
+        );
+
+        for line_idx in entries {
+            let code = self.lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
+            let comment = &self.comments[&line_idx];
+            text.push_str(&format!(
+                "\nLine {} (`{}`):\n{}\n",
+                line_idx + 1,
+                code,
+                comment
+            ));
+        }
+
+        let count = self.comments.len();
+        match set_clipboard(text) {
+            Ok(_) => self.status = Some(format!("Yanked {count} comment(s) to clipboard")),
             Err(e) => self.status = Some(format!("Clipboard error: {e}")),
         }
     }
@@ -303,6 +389,10 @@ impl App {
     }
 
     fn rehighlight(&mut self) {
+        if self.file_path.is_empty() {
+            self.highlighted_lines = Vec::new();
+            return;
+        }
         let highlighted = {
             let ext = Path::new(&self.file_path)
                 .extension()

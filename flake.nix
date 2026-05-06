@@ -32,6 +32,8 @@
               jj
               git
               ripgrep-all
+              wl-clipboard
+              xclip
             ];
             RUST_SRC_PATH = rustPlatform.rustLibSrc;
           };
