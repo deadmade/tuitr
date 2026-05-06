@@ -29,9 +29,13 @@ pub fn render(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
+    let tree_pct = app.tree_width_pct;
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+        .constraints([
+            Constraint::Percentage(tree_pct),
+            Constraint::Percentage(100 - tree_pct),
+        ])
         .split(outer[0]);
 
     render_tree(f, app, top[0]);
@@ -294,8 +298,9 @@ pub(crate) fn comment_editor_height(text: &str, area_width: u16) -> u16 {
     (visible.chars().count().div_ceil(text_width).max(1) + 2) as u16
 }
 
-pub(crate) fn file_area_width(total_width: u16) -> u16 {
-    total_width.saturating_sub(total_width / 4)
+pub(crate) fn file_area_width(total_width: u16, tree_width_pct: u16) -> u16 {
+    let tree_w = (total_width as u32 * tree_width_pct as u32 / 100) as u16;
+    total_width.saturating_sub(tree_w)
 }
 
 fn comment_text_width(area_width: u16) -> usize {
@@ -404,7 +409,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         .fg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  j/k:nav  Enter/l:open  Space/h:expand  Tab:switch  q:quit"),
+                Span::raw("  j/k/scroll:nav  Enter/l:open  Space/h:expand  Tab:switch  E:global-export  </>:resize  q:quit"),
             ]),
             (Mode::Normal, Focus::File) => Line::from(vec![
                 Span::styled(
@@ -415,7 +420,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(
-                    "  j/k:nav  /:search  n/N:next/prev  c:comment  d:del  D:del-all  y:yank  Y:yank-issues  g/G:top/bot  Tab:switch  q:quit",
+                    "  j/k/scroll:nav  /:search  n/N:next/prev  c:comment  d:del  D:del-all  y:yank  Y:yank-issues  E:global-export  </>:resize  g/G:top/bot  Tab:switch  q:quit",
                 ),
             ]),
         }

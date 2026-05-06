@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io, mem, path::Path, time::Duration};
+use std::{collections::HashMap, fs, io, path::Path, sync::mpsc::Receiver, time::Duration};
 
 use syntect::{
     easy::HighlightLines,
@@ -8,13 +8,46 @@ use syntect::{
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseEvent,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use rusqlite::{Connection, params};
 
 use crate::{tree::FileTree, ui};
+
+fn open_db() -> Result<Connection> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not find config directory"))?
+        .join("tuitr");
+    fs::create_dir_all(&config_dir)?;
+    let conn = Connection::open(config_dir.join("comments.db"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS comments (
+            file_path   TEXT    NOT NULL,
+            line_number INTEGER NOT NULL,
+            comment     TEXT    NOT NULL,
+            PRIMARY KEY (file_path, line_number)
+        );",
+    )?;
+    Ok(conn)
+}
+
+fn load_file_comments(db: &Connection, file_path: &str) -> HashMap<usize, String> {
+    db.prepare("SELECT line_number, comment FROM comments WHERE file_path = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map([file_path], |row| {
+                Ok((row.get::<_, i64>(0)? as usize, row.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+}
 
 fn set_clipboard(text: String) -> Result<()> {
     use std::io::Write;
@@ -48,26 +81,19 @@ fn set_clipboard(text: String) -> Result<()> {
     Ok(())
 }
 
-fn load_persisted_comments(root: &Path) -> HashMap<String, HashMap<usize, String>> {
-    let path = root.join(".tuitr.json");
-    let Ok(content) = fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&content) else {
-        return HashMap::new();
-    };
-    map.into_iter()
-        .filter_map(|(file, val)| {
-            let serde_json::Value::Object(cm) = val else {
-                return None;
-            };
-            let comments = cm
-                .into_iter()
-                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_str()?.to_owned())))
-                .collect();
-            Some((file, comments))
-        })
-        .collect()
+fn check_file_displayable(path: &str) -> Result<(), String> {
+    use std::io::Read;
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.len() > 10 * 1024 * 1024 {
+        return Err("File too large to display (> 10 MB)".to_string());
+    }
+    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+    if buf[..n].contains(&0u8) {
+        return Err("Binary file, cannot display".to_string());
+    }
+    Ok(())
 }
 
 pub enum Mode {
@@ -85,11 +111,11 @@ pub struct App {
     pub file_path: String,
     pub lines: Vec<String>,
     pub comments: HashMap<usize, String>,
-    all_comments: HashMap<String, HashMap<usize, String>>,
     pub cursor: usize,
     pub scroll: usize,
     pub view_height: usize,
     pub view_width: u16,
+    pub tree_width_pct: u16,
     pub mode: Mode,
     pub focus: Focus,
     pub input: String,
@@ -102,6 +128,9 @@ pub struct App {
     search_match_idx: usize,
     syntax_set: SyntaxSet,
     theme: Theme,
+    db: Connection,
+    watcher: RecommendedWatcher,
+    watch_rx: Receiver<notify::Result<notify::Event>>,
 }
 
 impl App {
@@ -112,6 +141,8 @@ impl App {
 
         let is_dir = Path::new(&abs).is_dir();
 
+        let mut initial_status: Option<String> = None;
+
         let (root, file_path, lines) = if is_dir {
             (Path::new(&abs).to_path_buf(), String::new(), Vec::new())
         } else {
@@ -119,30 +150,44 @@ impl App {
                 .parent()
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
-            let content = fs::read_to_string(&abs)?;
-            let lines = content.lines().map(String::from).collect();
-            (root, abs, lines)
+            match check_file_displayable(&abs) {
+                Ok(()) => {
+                    let content = fs::read_to_string(&abs)?;
+                    let lines = content.lines().map(String::from).collect();
+                    (root, abs, lines)
+                }
+                Err(msg) => {
+                    initial_status = Some(msg);
+                    (root, String::new(), Vec::new())
+                }
+            }
         };
 
-        let mut all_comments = load_persisted_comments(&root);
+        let db = open_db()?;
         let comments = if file_path.is_empty() {
             HashMap::new()
         } else {
-            all_comments.remove(&file_path).unwrap_or_default()
+            load_file_comments(&db, &file_path)
         };
 
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme = ThemeSet::load_defaults().themes["base16-ocean.dark"].clone();
 
+        let (tx, watch_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())?;
+        if !file_path.is_empty() {
+            let _ = watcher.watch(Path::new(&file_path), RecursiveMode::NonRecursive);
+        }
+
         let mut app = Self {
             file_path,
             lines,
             comments,
-            all_comments,
             cursor: 0,
             scroll: 0,
             view_height: 20,
             view_width: 80,
+            tree_width_pct: 25,
             mode: Mode::Normal,
             focus: if is_dir { Focus::Tree } else { Focus::File },
             input: String::new(),
@@ -155,19 +200,31 @@ impl App {
             search_match_idx: 0,
             syntax_set,
             theme,
+            db,
+            watcher,
+            watch_rx,
         };
         app.rehighlight();
+        app.status = initial_status;
         Ok(app)
     }
 
     pub fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         loop {
+            while let Ok(Ok(event)) = self.watch_rx.try_recv() {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+                    && let Err(e) = self.reload_file()
+                {
+                    self.status = Some(format!("Reload error: {e}"));
+                }
+            }
+
             terminal.draw(|f| {
                 let area = f.area();
                 let edit_h = if matches!(self.mode, Mode::EditComment) {
@@ -176,22 +233,30 @@ impl App {
                     0
                 };
                 self.view_height = area.height.saturating_sub(edit_h + 3) as usize;
-                self.view_width = ui::file_area_width(area.width);
+                self.view_width = ui::file_area_width(area.width, self.tree_width_pct);
                 self.tree.scroll_to_cursor(self.view_height);
                 ui::render(f, self);
             })?;
 
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(key) {
-                        break;
+                match event::read()? {
+                    Event::Key(key) => {
+                        if self.handle_key(key) {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
                 }
             }
         }
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
         Ok(())
     }
 
@@ -211,12 +276,37 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Tab => self.toggle_focus(),
+            KeyCode::Char('<') => {
+                self.tree_width_pct = self.tree_width_pct.saturating_sub(5).max(10)
+            }
+            KeyCode::Char('>') => self.tree_width_pct = (self.tree_width_pct + 5).min(50),
+            KeyCode::Char('E') => self.export_all_annotations(),
             _ => match self.focus {
                 Focus::Tree => self.handle_tree(key),
                 Focus::File => self.handle_file(key),
             },
         }
         false
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => match self.focus {
+                Focus::File => self.move_down(),
+                Focus::Tree => {
+                    self.tree.move_down();
+                    self.tree.scroll_to_cursor(self.view_height);
+                }
+            },
+            MouseEventKind::ScrollUp => match self.focus {
+                Focus::File => self.move_up(),
+                Focus::Tree => {
+                    self.tree.move_up();
+                    self.tree.scroll_to_cursor(self.view_height);
+                }
+            },
+            _ => {}
+        }
     }
 
     fn toggle_focus(&mut self) {
@@ -357,12 +447,19 @@ impl App {
         let text = self.input.trim().to_string();
         if text.is_empty() {
             self.comments.remove(&self.cursor);
+            let _ = self.db.execute(
+                "DELETE FROM comments WHERE file_path = ?1 AND line_number = ?2",
+                params![self.file_path, self.cursor as i64],
+            );
         } else {
-            self.comments.insert(self.cursor, text);
+            self.comments.insert(self.cursor, text.clone());
+            let _ = self.db.execute(
+                "INSERT OR REPLACE INTO comments (file_path, line_number, comment) VALUES (?1, ?2, ?3)",
+                params![self.file_path, self.cursor as i64, text],
+            );
         }
         self.input.clear();
         self.mode = Mode::Normal;
-        self.save_comments();
     }
 
     fn cancel_comment(&mut self) {
@@ -372,8 +469,11 @@ impl App {
 
     fn delete_comment(&mut self) {
         if self.comments.remove(&self.cursor).is_some() {
+            let _ = self.db.execute(
+                "DELETE FROM comments WHERE file_path = ?1 AND line_number = ?2",
+                params![self.file_path, self.cursor as i64],
+            );
             self.status = Some("Comment deleted".to_string());
-            self.save_comments();
         }
     }
 
@@ -384,8 +484,11 @@ impl App {
             return;
         }
         self.comments.clear();
+        let _ = self.db.execute(
+            "DELETE FROM comments WHERE file_path = ?1",
+            params![self.file_path],
+        );
         self.status = Some(format!("Deleted {count} comment(s)"));
-        self.save_comments();
     }
 
     fn yank(&mut self) {
@@ -431,6 +534,65 @@ impl App {
         let count = self.comments.len();
         match set_clipboard(text) {
             Ok(_) => self.status = Some(format!("Yanked {count} comment(s) to clipboard")),
+            Err(e) => self.status = Some(format!("Clipboard error: {e}")),
+        }
+    }
+
+    fn export_all_annotations(&mut self) {
+        let rows: Vec<(String, i64, String)> = match self
+            .db
+            .prepare(
+                "SELECT file_path, line_number, comment FROM comments ORDER BY file_path, line_number",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = Some(format!("DB error: {e}"));
+                return;
+            }
+        };
+
+        if rows.is_empty() {
+            self.status = Some("No annotations in database".to_string());
+            return;
+        }
+
+        let mut text = "I found the following issues across multiple files. Please create a plan to fix them:\n".to_string();
+        let mut current_file = String::new();
+        let mut file_lines: Vec<String> = Vec::new();
+
+        for (file_path, line_number, comment) in &rows {
+            if *file_path != current_file {
+                current_file = file_path.clone();
+                file_lines = fs::read_to_string(file_path)
+                    .map(|c| c.lines().map(String::from).collect())
+                    .unwrap_or_default();
+                text.push_str(&format!("\n### {file_path}\n"));
+            }
+            let code = file_lines
+                .get(*line_number as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            text.push_str(&format!(
+                "\nLine {} (`{}`):\n{}\n",
+                line_number + 1,
+                code,
+                comment
+            ));
+        }
+
+        let count = rows.len();
+        match set_clipboard(text) {
+            Ok(_) => self.status = Some(format!("Exported {count} annotation(s) globally")),
             Err(e) => self.status = Some(format!("Clipboard error: {e}")),
         }
     }
@@ -511,51 +673,41 @@ impl App {
         self.scroll_to_cursor();
     }
 
-    fn save_comments(&self) {
-        let path = self.tree.root.join(".tuitr.json");
-
-        let mut all = self.all_comments.clone();
-        if !self.file_path.is_empty() {
-            if self.comments.is_empty() {
-                all.remove(&self.file_path);
-            } else {
-                all.insert(self.file_path.clone(), self.comments.clone());
-            }
-        }
-        all.retain(|_, v| !v.is_empty());
-
-        if all.is_empty() {
-            let _ = fs::remove_file(&path);
-            return;
-        }
-
-        let raw: serde_json::Map<String, serde_json::Value> = all
-            .into_iter()
-            .map(|(file, comments)| {
-                let fm: serde_json::Map<String, serde_json::Value> = comments
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
-                    .collect();
-                (file, serde_json::Value::Object(fm))
-            })
-            .collect();
-
-        if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(raw)) {
-            let _ = fs::write(&path, json);
-        }
-    }
-
     fn load_file(&mut self, path: String) -> Result<()> {
+        if let Err(msg) = check_file_displayable(&path) {
+            self.status = Some(msg);
+            return Ok(());
+        }
+
+        if !self.file_path.is_empty() {
+            let _ = self.watcher.unwatch(Path::new(&self.file_path));
+        }
+        let _ = self.watcher.watch(Path::new(&path), RecursiveMode::NonRecursive);
+
         let content = fs::read_to_string(&path)?;
-        self.all_comments
-            .insert(self.file_path.clone(), mem::take(&mut self.comments));
         self.lines = content.lines().map(String::from).collect();
-        self.comments = self.all_comments.remove(&path).unwrap_or_default();
+        self.comments = load_file_comments(&self.db, &path);
         self.file_path = path;
         self.cursor = 0;
         self.scroll = 0;
         self.rehighlight();
         self.compute_matches();
+        Ok(())
+    }
+
+    fn reload_file(&mut self) -> Result<()> {
+        if self.file_path.is_empty() {
+            return Ok(());
+        }
+        let content = match fs::read_to_string(&self.file_path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        self.lines = content.lines().map(String::from).collect();
+        self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
+        self.rehighlight();
+        self.compute_matches();
+        self.status = Some("File reloaded".to_string());
         Ok(())
     }
 
@@ -569,7 +721,8 @@ impl App {
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
-            let syntax = self.syntax_set
+            let syntax = self
+                .syntax_set
                 .find_syntax_by_extension(ext)
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
             let mut h = HighlightLines::new(syntax, &self.theme);

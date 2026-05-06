@@ -1,10 +1,9 @@
 use std::{
     collections::HashSet,
-    fs,
     path::{Path, PathBuf},
 };
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::WalkBuilder;
 
 pub struct TreeEntry {
     pub path: PathBuf,
@@ -19,19 +18,16 @@ pub struct FileTree {
     pub cursor: usize,
     pub scroll: usize,
     expanded: HashSet<PathBuf>,
-    gitignore: Option<Gitignore>,
 }
 
 impl FileTree {
     pub fn new(root: PathBuf) -> Self {
-        let gitignore = build_gitignore(&root);
         let mut tree = Self {
             root: root.clone(),
             entries: Vec::new(),
             cursor: 0,
             scroll: 0,
             expanded: HashSet::new(),
-            gitignore,
         };
         tree.rebuild();
         tree
@@ -44,29 +40,21 @@ impl FileTree {
     }
 
     fn add_dir(&mut self, dir: &Path, depth: usize) {
-        let Ok(read_dir) = fs::read_dir(dir) else {
-            return;
-        };
-
-        let mut entries: Vec<_> = read_dir
+        let mut entries: Vec<_> = WalkBuilder::new(dir)
+            .max_depth(Some(1))
+            .build()
             .filter_map(|e| e.ok())
-            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-            .filter(|e| {
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                self.gitignore
-                    .as_ref()
-                    .map_or(true, |gi| !gi.matched(&e.path(), is_dir).is_ignore())
-            })
+            .filter(|e| e.depth() > 0)
             .collect();
 
         entries.sort_by(|a, b| {
             let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+            b_dir.cmp(&a_dir).then(a.path().file_name().cmp(&b.path().file_name()))
         });
 
         for e in entries {
-            let path = e.path();
+            let path = e.path().to_path_buf();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let is_expanded = self.expanded.contains(&path);
             self.entries.push(TreeEntry {
@@ -129,14 +117,4 @@ impl FileTree {
             self.scroll = self.cursor - view_height + 1;
         }
     }
-}
-
-fn build_gitignore(root: &Path) -> Option<Gitignore> {
-    let gi_path = root.join(".gitignore");
-    if !gi_path.exists() {
-        return None;
-    }
-    let mut builder = GitignoreBuilder::new(root);
-    builder.add(gi_path);
-    builder.build().ok()
 }
