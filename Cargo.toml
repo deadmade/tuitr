@@ -1,6 +1,6 @@
 [package]
 name = "tuitr"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 [dependencies]
@@ -13,3 +13,4 @@ ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 dirs = "5"
 notify = "6"
+similar = "2"

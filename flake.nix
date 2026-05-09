@@ -21,7 +21,7 @@
         tuitr = naersk-lib.buildPackage {
           src = ./.;
           nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; lib.optionals stdenv.isLinux [ xorg.libxcb ];
+          buildInputs = with pkgs; lib.optionals stdenv.isLinux [ libxcb ];
         };
       in
       {
