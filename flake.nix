@@ -30,6 +30,15 @@
           inherit tuitr;
         };
 
+        checks = {
+          test = naersk-lib.buildPackage {
+            src = ./.;
+            doCheck = true;
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; lib.optionals stdenv.isLinux [ libxcb ];
+          };
+        };
+
         devShells.default =
           with pkgs;
           mkShell {
@@ -38,6 +47,7 @@
               rustc
               rustfmt
               rustPackages.clippy
+              cargo-nextest
               jj
               git
               ripgrep-all
