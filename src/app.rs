@@ -63,11 +63,7 @@ fn set_clipboard(text: String) -> Result<()> {
     };
 
     for (cmd, args) in cmds {
-        let Ok(mut child) = Command::new(cmd)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .spawn()
-        else {
+        let Ok(mut child) = Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn() else {
             continue;
         };
         if let Some(stdin) = child.stdin.as_mut() {
@@ -132,6 +128,7 @@ pub struct App {
     pub lines: Vec<String>,
     pub comments: HashMap<usize, String>,
     pub cursor: usize,
+    pub editing_line: usize,
     pub scroll: usize,
     pub view_height: usize,
     pub view_width: u16,
@@ -207,6 +204,7 @@ impl App {
             lines,
             comments,
             cursor: 0,
+            editing_line: 0,
             scroll: 0,
             view_height: 20,
             view_width: 80,
@@ -414,8 +412,31 @@ impl App {
         }
     }
 
+    fn view_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Source => self.lines.len(),
+            ViewMode::LatexCompiled => {
+                self.compiled_lines.as_deref().map(|l| l.len()).unwrap_or(0)
+            }
+            ViewMode::GitDiff => self.diff_rows.as_deref().map(|r| r.len()).unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn source_line_for_cursor(&self) -> Option<usize> {
+        match self.view_mode {
+            ViewMode::Source => Some(self.cursor),
+            ViewMode::GitDiff => self
+                .diff_rows
+                .as_deref()
+                .and_then(|rows| rows.get(self.cursor))
+                .and_then(|row| row.new.as_ref())
+                .map(|(n, _)| n - 1),
+            ViewMode::LatexCompiled => None,
+        }
+    }
+
     fn move_down(&mut self) {
-        if self.cursor + 1 < self.lines.len() {
+        if self.cursor + 1 < self.view_len() {
             self.cursor += 1;
             self.scroll_to_cursor();
         }
@@ -434,7 +455,7 @@ impl App {
     }
 
     fn move_bottom(&mut self) {
-        self.cursor = self.lines.len().saturating_sub(1);
+        self.cursor = self.view_len().saturating_sub(1);
         self.scroll_to_cursor();
     }
 
@@ -442,47 +463,91 @@ impl App {
         if self.view_height == 0 {
             return;
         }
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-            return;
-        }
-        loop {
-            let rows: usize = (self.scroll..=self.cursor)
-                .map(|i| {
-                    let line = self.lines.get(i).map(|s| s.as_str()).unwrap_or("");
-                    ui::line_display_rows(line, self.view_width)
-                        + self
-                            .comments
-                            .get(&i)
-                            .map(|c| ui::comment_box_height(c, self.view_width))
-                            .unwrap_or(0)
-                })
-                .sum();
-            if rows <= self.view_height {
-                break;
+        match self.view_mode {
+            ViewMode::Source => {
+                if self.cursor < self.scroll {
+                    self.scroll = self.cursor;
+                    return;
+                }
+                loop {
+                    let rows: usize = (self.scroll..=self.cursor)
+                        .map(|i| {
+                            let line = self.lines.get(i).map(|s| s.as_str()).unwrap_or("");
+                            ui::line_display_rows(line, self.view_width)
+                                + self
+                                    .comments
+                                    .get(&i)
+                                    .map(|c| ui::comment_box_height(c, self.view_width))
+                                    .unwrap_or(0)
+                        })
+                        .sum();
+                    if rows <= self.view_height {
+                        break;
+                    }
+                    self.scroll += 1;
+                }
             }
-            self.scroll += 1;
+            ViewMode::GitDiff => {
+                if self.cursor < self.scroll {
+                    self.scroll = self.cursor;
+                    return;
+                }
+                let rows = self.diff_rows.as_deref().unwrap_or(&[]);
+                loop {
+                    let visible: usize = (self.scroll..=self.cursor)
+                        .map(|i| {
+                            let comment_h = rows
+                                .get(i)
+                                .and_then(|row| row.new.as_ref().map(|(n, _)| n - 1))
+                                .and_then(|src| self.comments.get(&src))
+                                .map(|c| ui::comment_box_height(c, self.view_width / 2))
+                                .unwrap_or(0);
+                            1 + comment_h
+                        })
+                        .sum();
+                    if visible <= self.view_height {
+                        break;
+                    }
+                    self.scroll += 1;
+                }
+            }
+            ViewMode::LatexCompiled => {
+                if self.cursor < self.scroll {
+                    self.scroll = self.cursor;
+                } else if self.cursor >= self.scroll + self.view_height {
+                    self.scroll = self.cursor.saturating_sub(self.view_height - 1);
+                }
+            }
         }
     }
 
-    fn start_comment(&mut self) {
-        self.input = self.comments.get(&self.cursor).cloned().unwrap_or_default();
-        self.mode = Mode::EditComment;
+    pub(crate) fn start_comment(&mut self) {
+        match self.source_line_for_cursor() {
+            None => {
+                self.status = Some("Comments not available in compiled view".to_string());
+            }
+            Some(src_line) => {
+                self.editing_line = src_line;
+                self.input = self.comments.get(&src_line).cloned().unwrap_or_default();
+                self.mode = Mode::EditComment;
+            }
+        }
     }
 
     fn confirm_comment(&mut self) {
+        let line = self.editing_line;
         let text = self.input.trim().to_string();
         if text.is_empty() {
-            self.comments.remove(&self.cursor);
+            self.comments.remove(&line);
             let _ = self.db.execute(
                 "DELETE FROM comments WHERE file_path = ?1 AND line_number = ?2",
-                params![self.file_path, self.cursor as i64],
+                params![self.file_path, line as i64],
             );
         } else {
-            self.comments.insert(self.cursor, text.clone());
+            self.comments.insert(line, text.clone());
             let _ = self.db.execute(
                 "INSERT OR REPLACE INTO comments (file_path, line_number, comment) VALUES (?1, ?2, ?3)",
-                params![self.file_path, self.cursor as i64, text],
+                params![self.file_path, line as i64, text],
             );
         }
         self.input.clear();
@@ -494,13 +559,20 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    fn delete_comment(&mut self) {
-        if self.comments.remove(&self.cursor).is_some() {
-            let _ = self.db.execute(
-                "DELETE FROM comments WHERE file_path = ?1 AND line_number = ?2",
-                params![self.file_path, self.cursor as i64],
-            );
-            self.status = Some("Comment deleted".to_string());
+    pub(crate) fn delete_comment(&mut self) {
+        match self.source_line_for_cursor() {
+            None => {
+                self.status = Some("Comments not available in compiled view".to_string());
+            }
+            Some(src_line) => {
+                if self.comments.remove(&src_line).is_some() {
+                    let _ = self.db.execute(
+                        "DELETE FROM comments WHERE file_path = ?1 AND line_number = ?2",
+                        params![self.file_path, src_line as i64],
+                    );
+                    self.status = Some("Comment deleted".to_string());
+                }
+            }
         }
     }
 
@@ -746,12 +818,10 @@ impl App {
             .args(["--from=latex", "--to=plain", &self.file_path])
             .output();
         self.compiled_lines = Some(match output {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect(),
             Ok(o) => {
                 let msg = String::from_utf8_lossy(&o.stderr).trim().to_owned();
                 vec![format!("[pandoc error: {msg}]")]
@@ -768,11 +838,7 @@ impl App {
         // Find git root
         let git_root = std::process::Command::new("git")
             .args(["rev-parse", "--show-toplevel"])
-            .current_dir(
-                Path::new(&file_path)
-                    .parent()
-                    .unwrap_or(Path::new(".")),
-            )
+            .current_dir(Path::new(&file_path).parent().unwrap_or(Path::new(".")))
             .output()
             .ok()
             .and_then(|o| {
@@ -822,16 +888,16 @@ impl App {
             for op in &group {
                 let old_range = op.old_range();
                 let new_range = op.new_range();
-                let head_lines: Vec<String> = head_text
-                    .lines()
-                    .collect::<Vec<_>>()[old_range.start.min(head_text.lines().count())
+                let head_lines: Vec<String> = head_text.lines().collect::<Vec<_>>()[old_range
+                    .start
+                    .min(head_text.lines().count())
                     ..old_range.end.min(head_text.lines().count())]
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
-                let new_lines: Vec<String> = current_text
-                    .lines()
-                    .collect::<Vec<_>>()[new_range.start.min(current_text.lines().count())
+                let new_lines: Vec<String> = current_text.lines().collect::<Vec<_>>()[new_range
+                    .start
+                    .min(current_text.lines().count())
                     ..new_range.end.min(current_text.lines().count())]
                     .iter()
                     .map(|s| s.to_string())
@@ -850,7 +916,11 @@ impl App {
                         ChangeTag::Equal => {
                             let old_idx = change.old_index().unwrap_or(0);
                             let new_idx = change.new_index().unwrap_or(0);
-                            contexts.push((old_idx, new_idx, change.value().trim_end_matches('\n').to_owned()));
+                            contexts.push((
+                                old_idx,
+                                new_idx,
+                                change.value().trim_end_matches('\n').to_owned(),
+                            ));
                         }
                         ChangeTag::Delete => {
                             let idx = change.old_index().unwrap_or(0);
@@ -896,7 +966,9 @@ impl App {
         if !self.file_path.is_empty() {
             let _ = self.watcher.unwatch(Path::new(&self.file_path));
         }
-        let _ = self.watcher.watch(Path::new(&path), RecursiveMode::NonRecursive);
+        let _ = self
+            .watcher
+            .watch(Path::new(&path), RecursiveMode::NonRecursive);
 
         let content = fs::read_to_string(&path)?;
         self.lines = content.lines().map(String::from).collect();
@@ -922,10 +994,60 @@ impl App {
         };
         self.lines = content.lines().map(String::from).collect();
         self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
+        self.scroll_to_cursor();
         self.rehighlight();
         self.compute_matches();
         self.status = Some("File reloaded".to_string());
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn new_for_test(lines: Vec<String>) -> Self {
+        use std::sync::mpsc;
+        let (tx, watch_rx) = mpsc::channel();
+        let watcher = notify::RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS comments (
+                file_path   TEXT    NOT NULL,
+                line_number INTEGER NOT NULL,
+                comment     TEXT    NOT NULL,
+                PRIMARY KEY (file_path, line_number)
+            );",
+        )
+        .unwrap();
+        let syntax_set = SyntaxSet::load_defaults_nonewlines();
+        let theme = ThemeSet::load_defaults().themes["base16-ocean.dark"].clone();
+        let n = lines.len();
+        App {
+            file_path: "/test/file.rs".to_string(),
+            lines,
+            comments: HashMap::new(),
+            cursor: 0,
+            editing_line: 0,
+            scroll: 0,
+            view_height: 20,
+            view_width: 80,
+            tree_width_pct: 25,
+            mode: Mode::Normal,
+            focus: Focus::File,
+            input: String::new(),
+            status: None,
+            tree: FileTree::new(std::env::temp_dir()),
+            highlighted_lines: vec![vec![]; n],
+            search_query: String::new(),
+            search_input: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
+            view_mode: ViewMode::Source,
+            compiled_lines: None,
+            diff_rows: None,
+            syntax_set,
+            theme,
+            db,
+            watcher,
+            watch_rx,
+        }
     }
 
     fn rehighlight(&mut self) {
@@ -955,5 +1077,326 @@ impl App {
                 .collect::<Vec<_>>()
         };
         self.highlighted_lines = highlighted;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- load_file_comments ---
+
+    #[test]
+    fn load_file_comments_retrieves_from_db() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS comments (
+                file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
+                comment TEXT NOT NULL, PRIMARY KEY (file_path, line_number)
+            );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO comments VALUES (?1, ?2, ?3)",
+            params!["/foo.rs", 3i64, "test note"],
+        )
+        .unwrap();
+        let result = load_file_comments(&db, "/foo.rs");
+        assert_eq!(result.get(&3), Some(&"test note".to_string()));
+        assert_eq!(result.len(), 1);
+    }
+
+    // --- compute_matches ---
+
+    #[test]
+    fn compute_matches_case_insensitive() {
+        let mut app = App::new_for_test(lines(&["foo bar", "baz", "FOO"]));
+        app.search_query = "foo".to_string();
+        app.compute_matches();
+        assert_eq!(app.search_matches, vec![0, 2]);
+    }
+
+    #[test]
+    fn compute_matches_empty_query_clears() {
+        let mut app = App::new_for_test(lines(&["foo", "bar"]));
+        app.search_matches = vec![0];
+        app.search_query = String::new();
+        app.compute_matches();
+        assert!(app.search_matches.is_empty());
+    }
+
+    // --- next_match / prev_match ---
+
+    #[test]
+    fn next_match_wraps_to_first() {
+        let mut app = App::new_for_test(lines(&["a", "b", "a"]));
+        app.search_matches = vec![0, 2];
+        app.search_match_idx = 1;
+        app.cursor = 2;
+        app.next_match();
+        assert_eq!(app.search_match_idx, 0);
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn prev_match_wraps_to_last() {
+        let mut app = App::new_for_test(lines(&["a", "b", "a"]));
+        app.search_matches = vec![0, 2];
+        app.search_match_idx = 0;
+        app.cursor = 0;
+        app.prev_match();
+        assert_eq!(app.search_match_idx, 1);
+        assert_eq!(app.cursor, 2);
+    }
+
+    // --- navigation bounds ---
+
+    #[test]
+    fn move_down_bounded_at_last_line() {
+        let mut app = App::new_for_test(lines(&["only"]));
+        app.move_down();
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn move_up_bounded_at_zero() {
+        let mut app = App::new_for_test(lines(&["a", "b"]));
+        app.move_up();
+        assert_eq!(app.cursor, 0);
+    }
+
+    // --- scroll_to_cursor ---
+
+    #[test]
+    fn scroll_advances_when_cursor_below_viewport() {
+        let many: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        let mut app = App::new_for_test(many);
+        app.view_height = 10;
+        app.view_width = 80;
+        app.cursor = 20;
+        app.scroll = 0;
+        app.scroll_to_cursor();
+        assert!(app.scroll > 0);
+        assert!(app.cursor >= app.scroll);
+    }
+
+    #[test]
+    fn scroll_resets_when_cursor_above_scroll() {
+        let many: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        let mut app = App::new_for_test(many);
+        app.view_height = 10;
+        app.view_width = 80;
+        app.scroll = 10;
+        app.cursor = 5;
+        app.scroll_to_cursor();
+        assert_eq!(app.scroll, 5);
+    }
+
+    // --- comment CRUD ---
+
+    #[test]
+    fn confirm_comment_inserts_into_hashmap_and_db() {
+        let mut app = App::new_for_test(lines(&["line one", "line two"]));
+        app.cursor = 0;
+        app.editing_line = 0;
+        app.input = "my note".to_string();
+        app.confirm_comment();
+        assert_eq!(app.comments.get(&0), Some(&"my note".to_string()));
+        let fp = app.file_path.clone();
+        let count: i64 = app
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM comments WHERE file_path = ?1 AND line_number = 0",
+                params![fp],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn confirm_comment_whitespace_only_removes() {
+        let mut app = App::new_for_test(lines(&["line one"]));
+        app.cursor = 0;
+        app.editing_line = 0;
+        app.comments.insert(0, "existing".to_string());
+        app.input = "   ".to_string();
+        app.confirm_comment();
+        assert!(!app.comments.contains_key(&0));
+    }
+
+    #[test]
+    fn delete_comment_removes_from_hashmap_and_db() {
+        let mut app = App::new_for_test(lines(&["line one"]));
+        app.cursor = 0;
+        app.editing_line = 0;
+        app.comments.insert(0, "note".to_string());
+        let fp = app.file_path.clone();
+        app.db
+            .execute(
+                "INSERT OR REPLACE INTO comments (file_path, line_number, comment) VALUES (?1, ?2, ?3)",
+                params![fp, 0i64, "note"],
+            )
+            .unwrap();
+        app.delete_comment();
+        assert!(!app.comments.contains_key(&0));
+        let count: i64 = app
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM comments WHERE file_path = ?1 AND line_number = 0",
+                params![fp],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // --- source_line_for_cursor ---
+
+    #[test]
+    fn source_line_for_cursor_source_returns_cursor() {
+        let mut app = App::new_for_test(lines(&["a", "b"]));
+        app.cursor = 1;
+        assert_eq!(app.source_line_for_cursor(), Some(1));
+    }
+
+    #[test]
+    fn source_line_for_cursor_gitdiff_maps_new_line() {
+        let mut app = App::new_for_test(lines(&["a", "b", "c"]));
+        app.view_mode = ViewMode::GitDiff;
+        app.diff_rows = Some(vec![DiffRow {
+            old: None,
+            new: Some((3, "c".into())),
+            kind: DiffRowKind::Changed,
+        }]);
+        app.cursor = 0;
+        assert_eq!(app.source_line_for_cursor(), Some(2)); // 3 - 1 = 2
+    }
+
+    #[test]
+    fn source_line_for_cursor_gitdiff_old_only_is_none() {
+        let mut app = App::new_for_test(lines(&["a"]));
+        app.view_mode = ViewMode::GitDiff;
+        app.diff_rows = Some(vec![DiffRow {
+            old: Some((1, "a".into())),
+            new: None,
+            kind: DiffRowKind::Changed,
+        }]);
+        app.cursor = 0;
+        assert_eq!(app.source_line_for_cursor(), None);
+    }
+
+    #[test]
+    fn source_line_for_cursor_latex_is_none() {
+        let mut app = App::new_for_test(lines(&["x"]));
+        app.view_mode = ViewMode::LatexCompiled;
+        app.compiled_lines = Some(vec!["compiled".into()]);
+        assert_eq!(app.source_line_for_cursor(), None);
+    }
+
+    // --- view_len / move_down in non-source views ---
+
+    #[test]
+    fn move_down_bounded_by_diff_rows() {
+        let mut app = App::new_for_test(lines(&["a", "b", "c"]));
+        app.view_mode = ViewMode::GitDiff;
+        app.diff_rows = Some(vec![DiffRow {
+            old: None,
+            new: Some((1, "a".into())),
+            kind: DiffRowKind::Context,
+        }]);
+        app.cursor = 0;
+        app.move_down();
+        assert_eq!(app.cursor, 0); // only 1 diff row, cannot advance
+    }
+
+    // --- start_comment in LaTeX view ---
+
+    #[test]
+    fn start_comment_latex_blocks_with_status() {
+        let mut app = App::new_for_test(lines(&["x"]));
+        app.view_mode = ViewMode::LatexCompiled;
+        app.compiled_lines = Some(vec!["compiled".into()]);
+        app.start_comment();
+        assert!(app.status.is_some());
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    // --- delete_comment in LaTeX view ---
+
+    #[test]
+    fn delete_comment_latex_blocks_with_status() {
+        let mut app = App::new_for_test(lines(&["x"]));
+        app.view_mode = ViewMode::LatexCompiled;
+        app.compiled_lines = Some(vec!["compiled".into()]);
+        app.delete_comment();
+        assert!(app.status.is_some());
+    }
+
+    // --- confirm_comment uses editing_line not cursor ---
+
+    #[test]
+    fn confirm_comment_uses_editing_line_not_cursor() {
+        let mut app = App::new_for_test(lines(&["a", "b", "c"]));
+        app.cursor = 2;
+        app.editing_line = 1; // diverged from cursor
+        app.input = "note on line 1".to_string();
+        app.confirm_comment();
+        assert!(app.comments.contains_key(&1));
+        assert!(!app.comments.contains_key(&2));
+    }
+
+    // --- reload_file ---
+
+    #[test]
+    fn reload_file_updates_lines() {
+        use tempfile::NamedTempFile;
+        let mut f = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, b"alpha\nbeta\n").unwrap();
+        let mut app = App::new_for_test(lines(&[]));
+        app.file_path = f.path().to_string_lossy().into_owned();
+        app.reload_file().unwrap();
+        assert_eq!(app.lines, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn reload_file_clamps_cursor_when_file_shrinks() {
+        use tempfile::NamedTempFile;
+        let mut f = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, b"only\n").unwrap();
+        let mut app = App::new_for_test(lines(&["a", "b", "c", "d", "e"]));
+        app.cursor = 4;
+        app.file_path = f.path().to_string_lossy().into_owned();
+        app.reload_file().unwrap();
+        assert_eq!(app.cursor, 0); // file has 1 line → cursor clamped to 0
+    }
+
+    #[test]
+    fn reload_file_adjusts_scroll_after_shrink() {
+        use tempfile::NamedTempFile;
+        let mut f = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, b"only\n").unwrap();
+        let mut app = App::new_for_test(lines(&["a", "b", "c", "d", "e"]));
+        app.cursor = 4;
+        app.scroll = 4; // scroll was at the bottom of the old content
+        app.view_height = 10;
+        app.file_path = f.path().to_string_lossy().into_owned();
+        app.reload_file().unwrap();
+        // cursor clamped to 0, scroll must also be 0
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn reload_file_ok_when_file_deleted() {
+        let mut app = App::new_for_test(lines(&["a", "b"]));
+        app.file_path = "/tmp/tuitr_nonexistent_file_xyz".to_string();
+        let result = app.reload_file();
+        assert!(result.is_ok());
+        // lines unchanged since file didn't exist
+        assert_eq!(app.lines, vec!["a", "b"]);
     }
 }

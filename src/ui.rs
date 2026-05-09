@@ -126,7 +126,11 @@ fn render_file(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
         let y = inner.height / 2;
-        let hint_area = Rect { y: inner.y + y, height: 1, ..inner };
+        let hint_area = Rect {
+            y: inner.y + y,
+            height: 1,
+            ..inner
+        };
         f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
         return;
     }
@@ -158,10 +162,21 @@ fn render_source(f: &mut Frame, app: &App, area: Rect, block: Block) {
 
     while i < app.lines.len() && rows < inner_height {
         let comment = app.comments.get(&i);
-        let hl = app.highlighted_lines.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let hl = app
+            .highlighted_lines
+            .get(i)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let is_match = !app.search_query.is_empty() && app.search_matches.contains(&i);
 
-        let new_lines = file_lines(i, hl, i == app.cursor, comment.is_some(), is_match, text_width);
+        let new_lines = file_lines(
+            i,
+            hl,
+            i == app.cursor,
+            comment.is_some(),
+            is_match,
+            text_width,
+        );
         rows += new_lines.len();
         display.extend(new_lines);
 
@@ -198,7 +213,11 @@ fn render_latex_compiled(f: &mut Frame, app: &App, area: Rect, block: Block) {
         let wrapped_rows = char_count.div_ceil(text_width.max(1));
         let mut first = true;
         for chunk_start in (0..char_count).step_by(text_width.max(1)) {
-            let chunk: String = line_text.chars().skip(chunk_start).take(text_width.max(1)).collect();
+            let chunk: String = line_text
+                .chars()
+                .skip(chunk_start)
+                .take(text_width.max(1))
+                .collect();
             let gutter = if first {
                 vec![
                     Span::styled("  ", Style::default().fg(Color::DarkGray)),
@@ -224,7 +243,10 @@ fn render_latex_compiled(f: &mut Frame, app: &App, area: Rect, block: Block) {
             // empty line
             let spans = vec![
                 Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:4} ", i + 1), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:4} ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled("  ", Style::default()),
             ];
             display.push(Line::from(spans));
@@ -253,8 +275,18 @@ fn render_git_diff(f: &mut Frame, app: &App, area: Rect, block: Block) {
 
     // Reserve 1 col for separator, split rest evenly
     let half = (inner.width.saturating_sub(1)) / 2;
-    let left_area = Rect { x: inner.x, y: inner.y, width: half, height: inner.height };
-    let sep_area = Rect { x: inner.x + half, y: inner.y, width: 1, height: inner.height };
+    let left_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: half,
+        height: inner.height,
+    };
+    let sep_area = Rect {
+        x: inner.x + half,
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
     let right_area = Rect {
         x: inner.x + half + 1,
         y: inner.y,
@@ -262,8 +294,10 @@ fn render_git_diff(f: &mut Frame, app: &App, area: Rect, block: Block) {
         height: inner.height,
     };
 
-    const DIFF_GUTTER: usize = 6; // " 1234 "
-    let text_w = (half as usize).saturating_sub(DIFF_GUTTER).max(1);
+    const DIFF_GUTTER: usize = 6;
+    const RIGHT_GUTTER: usize = 9; // "▶ "(2) + "1234 "(5) + "● "(2)
+    let left_text_w = (half as usize).saturating_sub(DIFF_GUTTER).max(1);
+    let right_text_w = (right_area.width as usize).saturating_sub(RIGHT_GUTTER).max(1);
 
     let rows = match &app.diff_rows {
         Some(r) => r.as_slice(),
@@ -271,7 +305,9 @@ fn render_git_diff(f: &mut Frame, app: &App, area: Rect, block: Block) {
     };
 
     // Draw separator column
-    let sep_lines: Vec<Line> = (0..inner.height).map(|_| Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)))).collect();
+    let sep_lines: Vec<Line> = (0..inner.height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(Color::DarkGray))))
+        .collect();
     f.render_widget(Paragraph::new(sep_lines), sep_area);
 
     if rows.is_empty() {
@@ -279,8 +315,14 @@ fn render_git_diff(f: &mut Frame, app: &App, area: Rect, block: Block) {
             "  No changes vs HEAD",
             Style::default().fg(Color::DarkGray),
         ));
-        f.render_widget(Paragraph::new(vec![msg.clone()]).alignment(Alignment::Left), left_area);
-        f.render_widget(Paragraph::new(vec![msg]).alignment(Alignment::Left), right_area);
+        f.render_widget(
+            Paragraph::new(vec![msg.clone()]).alignment(Alignment::Left),
+            left_area,
+        );
+        f.render_widget(
+            Paragraph::new(vec![msg]).alignment(Alignment::Left),
+            right_area,
+        );
         return;
     }
 
@@ -291,49 +333,96 @@ fn render_git_diff(f: &mut Frame, app: &App, area: Rect, block: Block) {
     ))];
     let mut right_display: Vec<Line> = vec![Line::from(Span::styled(
         " Working Tree",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     ))];
     let mut visible = 1usize; // header row
 
     let inner_h = inner.height as usize;
 
-    for row in rows.iter().skip(app.scroll) {
+    for (row_idx, row) in rows.iter().enumerate().skip(app.scroll) {
         if visible >= inner_h {
             break;
         }
 
-        let (old_bg, new_bg) = match row.kind {
-            DiffRowKind::Context => (Color::Reset, Color::Reset),
-            DiffRowKind::Changed => (
-                if row.old.is_some() { Color::Red } else { Color::Reset },
-                if row.new.is_some() { Color::Green } else { Color::Reset },
-            ),
+        let is_cursor = row_idx == app.cursor;
+        let src_line: Option<usize> = row.new.as_ref().map(|(n, _)| n - 1);
+        let comment_text = src_line.and_then(|l| app.comments.get(&l));
+        let has_comment = comment_text.is_some();
+
+        let base_old_bg = match row.kind {
+            DiffRowKind::Changed if row.old.is_some() => Color::Red,
+            _ => Color::Reset,
         };
+        let base_new_bg = match row.kind {
+            DiffRowKind::Changed if row.new.is_some() => Color::Green,
+            _ => Color::Reset,
+        };
+        let old_bg = if is_cursor { Color::DarkGray } else { base_old_bg };
+        let new_bg = if is_cursor { Color::DarkGray } else { base_new_bg };
 
-        let old_content = row.old.as_ref().map(|(n, s)| (*n, s.as_str())).unwrap_or((0, ""));
-        let new_content = row.new.as_ref().map(|(n, s)| (*n, s.as_str())).unwrap_or((0, ""));
-
-        let fmt_side = |line_no: usize, text: &str, bg: Color, present: bool| -> Line<'static> {
-            let num_span = if present {
+        let (old_no, old_text) = row
+            .old
+            .as_ref()
+            .map(|(n, s)| (*n, s.as_str()))
+            .unwrap_or((0, ""));
+        let left_content: String = old_text.chars().take(left_text_w).collect();
+        let left_pad = left_text_w.saturating_sub(left_content.chars().count());
+        let left_line = Line::from(vec![
+            Span::styled(" ", Style::default().bg(old_bg)),
+            if row.old.is_some() {
                 Span::styled(
-                    format!("{:4} ", line_no),
-                    Style::default().fg(Color::DarkGray).bg(bg),
+                    format!("{:4} ", old_no),
+                    Style::default().fg(Color::DarkGray).bg(old_bg),
                 )
             } else {
-                Span::styled(format!("{:4} ", ""), Style::default().bg(bg))
-            };
-            let content: String = text.chars().take(text_w).collect();
-            let pad = text_w.saturating_sub(content.chars().count());
-            Line::from(vec![
-                Span::styled(" ", Style::default().bg(bg)),
-                num_span,
-                Span::styled(content + &" ".repeat(pad), Style::default().bg(bg)),
-            ])
-        };
+                Span::styled(format!("{:4} ", ""), Style::default().bg(old_bg))
+            },
+            Span::styled(left_content + &" ".repeat(left_pad), Style::default().bg(old_bg)),
+        ]);
 
-        left_display.push(fmt_side(old_content.0, old_content.1, old_bg, row.old.is_some()));
-        right_display.push(fmt_side(new_content.0, new_content.1, new_bg, row.new.is_some()));
+        let (new_no, new_text) = row
+            .new
+            .as_ref()
+            .map(|(n, s)| (*n, s.as_str()))
+            .unwrap_or((0, ""));
+        let right_content: String = new_text.chars().take(right_text_w).collect();
+        let right_pad = right_text_w.saturating_sub(right_content.chars().count());
+        let right_line = Line::from(vec![
+            Span::styled(
+                if is_cursor { "▶ " } else { "  " },
+                Style::default().fg(Color::Yellow).bg(new_bg),
+            ),
+            if row.new.is_some() {
+                Span::styled(
+                    format!("{:4} ", new_no),
+                    Style::default().fg(Color::DarkGray).bg(new_bg),
+                )
+            } else {
+                Span::styled(format!("{:4} ", ""), Style::default().bg(new_bg))
+            },
+            Span::styled(
+                if has_comment { "● " } else { "  " },
+                Style::default().fg(Color::Cyan).bg(new_bg),
+            ),
+            Span::styled(right_content + &" ".repeat(right_pad), Style::default().bg(new_bg)),
+        ]);
+
+        left_display.push(left_line);
+        right_display.push(right_line);
         visible += 1;
+
+        if let Some(text) = comment_text {
+            for box_line in inline_comment_bordered(text, right_area.width) {
+                if visible >= inner_h {
+                    break;
+                }
+                left_display.push(Line::default());
+                right_display.push(box_line);
+                visible += 1;
+            }
+        }
     }
 
     f.render_widget(Paragraph::new(left_display), left_area);
@@ -357,7 +446,9 @@ fn wrap_spans(
         for ch in text.chars() {
             if col == available_width {
                 if !chunk.is_empty() {
-                    rows.last_mut().unwrap().push(Span::styled(chunk.clone(), style));
+                    rows.last_mut()
+                        .unwrap()
+                        .push(Span::styled(chunk.clone(), style));
                     chunk.clear();
                 }
                 rows.push(vec![]);
@@ -383,7 +474,11 @@ fn file_lines(
     is_match: bool,
     text_width: usize,
 ) -> Vec<Line<'static>> {
-    let bg = if is_cursor { Color::DarkGray } else { Color::Reset };
+    let bg = if is_cursor {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
     let wrapped = wrap_spans(hl_spans, text_width, bg);
     let mut lines = Vec::new();
 
@@ -527,7 +622,7 @@ fn push_wrapped_word(lines: &mut Vec<String>, line: &mut String, word: &str, wid
 fn render_comment_edit(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Comment (line {}) ", app.cursor + 1))
+        .title(format!(" Comment (line {}) ", app.editing_line + 1))
         .border_style(Style::default().fg(Color::Yellow));
 
     f.render_widget(
@@ -536,6 +631,92 @@ fn render_comment_edit(f: &mut Frame, app: &App, area: Rect) {
             .wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_display_rows_empty_is_one() {
+        assert_eq!(line_display_rows("", 80), 1);
+    }
+
+    #[test]
+    fn line_display_rows_short_fits_in_one() {
+        assert_eq!(line_display_rows("hello", 80), 1);
+    }
+
+    #[test]
+    fn line_display_rows_exactly_fills_width() {
+        // available = 80 - 2 - GUTTER(9) = 69
+        let line = "a".repeat(69);
+        assert_eq!(line_display_rows(&line, 80), 1);
+    }
+
+    #[test]
+    fn line_display_rows_one_over_wraps() {
+        let line = "a".repeat(70);
+        assert_eq!(line_display_rows(&line, 80), 2);
+    }
+
+    #[test]
+    fn comment_box_height_empty_text_is_three() {
+        // wrap_text("", w) → [""], 1 line + 2 borders = 3
+        assert_eq!(comment_box_height("", 80), 3);
+    }
+
+    #[test]
+    fn comment_box_height_short_text_is_three() {
+        assert_eq!(comment_box_height("hello", 80), 3);
+    }
+
+    #[test]
+    fn comment_box_height_long_word_wraps() {
+        // comment_text_width(80) = 65; a 66-char word forces 2 content rows → height 4
+        let text = "a".repeat(66);
+        assert_eq!(comment_box_height(&text, 80), 4);
+    }
+
+    #[test]
+    fn file_area_width_25_pct_of_100() {
+        // tree = 25, file = 75
+        assert_eq!(file_area_width(100, 25), 75);
+    }
+
+    #[test]
+    fn file_area_width_50_pct_of_200() {
+        assert_eq!(file_area_width(200, 50), 100);
+    }
+
+    #[test]
+    fn file_area_width_zero_total() {
+        assert_eq!(file_area_width(0, 25), 0);
+    }
+
+    #[test]
+    fn wrap_text_single_short_word() {
+        assert_eq!(wrap_text("hello", 20), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_text_wraps_on_word_boundary() {
+        // "hello world" width 8: "hello"(5) fits, "world"(5) makes 5+1+5=11 > 8 → new line
+        assert_eq!(wrap_text("hello world", 8), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn wrap_text_empty_yields_one_empty_line() {
+        assert_eq!(wrap_text("", 10), vec![""]);
+    }
+
+    #[test]
+    fn wrap_text_long_word_no_panic() {
+        // word longer than width must not panic and must preserve all chars
+        let result = wrap_text("abcdefghij", 5);
+        assert!(!result.is_empty());
+        assert_eq!(result.join(""), "abcdefghij");
+    }
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -577,7 +758,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         .fg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  j/k/scroll:nav  Enter/l:open  Space/h:expand  Tab:switch  E:global-export  </>:resize  q:quit"),
+                Span::raw(
+                    "  j/k/scroll:nav  Enter/l:open  Space/h:expand  Tab:switch  E:global-export  </>:resize  q:quit",
+                ),
             ]),
             (Mode::Normal, Focus::File) => Line::from(vec![
                 Span::styled(
