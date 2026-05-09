@@ -1,0 +1,17 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: nixos/nix
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+      - run: nix flake check
+      - run: nix develop --command cargo fmt --check
+      - run: nix develop --command cargo clippy -- -D warnings
