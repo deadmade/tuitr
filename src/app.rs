@@ -107,6 +107,26 @@ pub enum Focus {
     File,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    Source,
+    LatexCompiled,
+    GitDiff,
+}
+
+#[derive(Clone)]
+pub enum DiffRowKind {
+    Context,
+    Changed,
+}
+
+#[derive(Clone)]
+pub struct DiffRow {
+    pub old: Option<(usize, String)>,
+    pub new: Option<(usize, String)>,
+    pub kind: DiffRowKind,
+}
+
 pub struct App {
     pub file_path: String,
     pub lines: Vec<String>,
@@ -126,6 +146,9 @@ pub struct App {
     pub search_input: String,
     pub search_matches: Vec<usize>,
     search_match_idx: usize,
+    pub view_mode: ViewMode,
+    pub compiled_lines: Option<Vec<String>>,
+    pub diff_rows: Option<Vec<DiffRow>>,
     syntax_set: SyntaxSet,
     theme: Theme,
     db: Connection,
@@ -198,6 +221,9 @@ impl App {
             search_input: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            view_mode: ViewMode::Source,
+            compiled_lines: None,
+            diff_rows: None,
             syntax_set,
             theme,
             db,
@@ -359,6 +385,7 @@ impl App {
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.next_match(),
             KeyCode::Char('N') => self.prev_match(),
+            KeyCode::Char('v') => self.switch_view_mode(),
             _ => {}
         }
     }
@@ -673,6 +700,193 @@ impl App {
         self.scroll_to_cursor();
     }
 
+    fn available_view_modes(&self) -> Vec<ViewMode> {
+        let mut modes = vec![ViewMode::Source];
+        let ext = Path::new(&self.file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("tex") {
+            modes.push(ViewMode::LatexCompiled);
+        }
+        let in_git = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(
+                Path::new(&self.file_path)
+                    .parent()
+                    .unwrap_or(Path::new(".")),
+            )
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if in_git {
+            modes.push(ViewMode::GitDiff);
+        }
+        modes
+    }
+
+    fn switch_view_mode(&mut self) {
+        if self.file_path.is_empty() {
+            return;
+        }
+        let modes = self.available_view_modes();
+        let cur = modes.iter().position(|m| *m == self.view_mode).unwrap_or(0);
+        let next = modes[(cur + 1) % modes.len()];
+        self.view_mode = next;
+        self.scroll = 0;
+        match next {
+            ViewMode::LatexCompiled => self.compile_latex(),
+            ViewMode::GitDiff => self.compute_diff(),
+            ViewMode::Source => {}
+        }
+    }
+
+    fn compile_latex(&mut self) {
+        let output = std::process::Command::new("pandoc")
+            .args(["--from=latex", "--to=plain", &self.file_path])
+            .output();
+        self.compiled_lines = Some(match output {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            }
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                vec![format!("[pandoc error: {msg}]")]
+            }
+            Err(e) => vec![format!("[pandoc not found: {e}]")],
+        });
+    }
+
+    fn compute_diff(&mut self) {
+        use similar::{ChangeTag, TextDiff};
+
+        let file_path = self.file_path.clone();
+
+        // Find git root
+        let git_root = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(
+                Path::new(&file_path)
+                    .parent()
+                    .unwrap_or(Path::new(".")),
+            )
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                } else {
+                    None
+                }
+            });
+
+        let Some(root) = git_root else {
+            self.diff_rows = Some(vec![DiffRow {
+                old: Some((0, "[not a git repository]".into())),
+                new: None,
+                kind: DiffRowKind::Changed,
+            }]);
+            return;
+        };
+
+        // Get relative path for git show
+        let rel = Path::new(&file_path)
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| file_path.clone());
+
+        let head_output = std::process::Command::new("git")
+            .args(["show", &format!("HEAD:{rel}")])
+            .current_dir(&root)
+            .output();
+
+        let head_text = match head_output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => String::new(),
+        };
+
+        let current_text = self.lines.join("\n") + "\n";
+
+        if head_text == current_text || (head_text.is_empty() && self.lines.is_empty()) {
+            self.diff_rows = Some(vec![]);
+            return;
+        }
+
+        let diff = TextDiff::from_lines(&head_text, &current_text);
+        let mut rows: Vec<DiffRow> = Vec::new();
+
+        for group in diff.grouped_ops(3) {
+            for op in &group {
+                let old_range = op.old_range();
+                let new_range = op.new_range();
+                let head_lines: Vec<String> = head_text
+                    .lines()
+                    .collect::<Vec<_>>()[old_range.start.min(head_text.lines().count())
+                    ..old_range.end.min(head_text.lines().count())]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let new_lines: Vec<String> = current_text
+                    .lines()
+                    .collect::<Vec<_>>()[new_range.start.min(current_text.lines().count())
+                    ..new_range.end.min(current_text.lines().count())]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // Use the change iterator for this op to get accurate tags
+                let changes: Vec<_> = diff.iter_changes(op).collect();
+                let mut deletes: Vec<(usize, String)> = Vec::new();
+                let mut inserts: Vec<(usize, String)> = Vec::new();
+                let mut contexts: Vec<(usize, usize, String)> = Vec::new();
+
+                let _ = (head_lines, new_lines); // suppress unused warning
+
+                for change in &changes {
+                    match change.tag() {
+                        ChangeTag::Equal => {
+                            let old_idx = change.old_index().unwrap_or(0);
+                            let new_idx = change.new_index().unwrap_or(0);
+                            contexts.push((old_idx, new_idx, change.value().trim_end_matches('\n').to_owned()));
+                        }
+                        ChangeTag::Delete => {
+                            let idx = change.old_index().unwrap_or(0);
+                            deletes.push((idx, change.value().trim_end_matches('\n').to_owned()));
+                        }
+                        ChangeTag::Insert => {
+                            let idx = change.new_index().unwrap_or(0);
+                            inserts.push((idx, change.value().trim_end_matches('\n').to_owned()));
+                        }
+                    }
+                }
+
+                // Context lines first (they appear before changes in grouped_ops equal sections)
+                for (old_idx, new_idx, text) in contexts {
+                    rows.push(DiffRow {
+                        old: Some((old_idx + 1, text.clone())),
+                        new: Some((new_idx + 1, text)),
+                        kind: DiffRowKind::Context,
+                    });
+                }
+
+                // Pair up deletes and inserts
+                let max = deletes.len().max(inserts.len());
+                for i in 0..max {
+                    rows.push(DiffRow {
+                        old: deletes.get(i).cloned().map(|(n, s)| (n + 1, s)),
+                        new: inserts.get(i).cloned().map(|(n, s)| (n + 1, s)),
+                        kind: DiffRowKind::Changed,
+                    });
+                }
+            }
+        }
+
+        self.diff_rows = Some(rows);
+    }
+
     fn load_file(&mut self, path: String) -> Result<()> {
         if let Err(msg) = check_file_displayable(&path) {
             self.status = Some(msg);
@@ -690,6 +904,9 @@ impl App {
         self.file_path = path;
         self.cursor = 0;
         self.scroll = 0;
+        self.view_mode = ViewMode::Source;
+        self.compiled_lines = None;
+        self.diff_rows = None;
         self.rehighlight();
         self.compute_matches();
         Ok(())
