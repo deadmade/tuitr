@@ -7,14 +7,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    container:
-      image: nixos/nix
     steps:
-      - name: Enable Nix flakes
-        run: echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
-      - name: Install Node.js for GitHub Actions
-        run: nix-env -iA nixpkgs.nodejs_20
       - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
       - run: nix flake check
       - run: nix develop --command cargo fmt --check
       - run: nix develop --command cargo clippy -- -D warnings
